@@ -1,0 +1,18 @@
+# 数据(约 900MB, 通过脚本重新下载)
+data/raw/
+
+# 数据库构建产物(通过脚本重新生成)
+data/*.db
+data/*.db-wal
+data/*.db-shm
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+
+# 系统
+.DS_Store
+Thumbs.db
