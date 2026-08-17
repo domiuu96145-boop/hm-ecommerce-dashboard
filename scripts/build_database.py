@@ -131,6 +131,7 @@ def build_derived_tables(con: sqlite3.Connection) -> None:
         CREATE TABLE monthly_metrics AS
         WITH per_customer AS (
             SELECT strftime('%Y-%m', t_dat) AS ym,
+                   strftime('%Y-%m-01', t_dat) AS month_date,
                    sales_channel_id AS channel,
                    customer_id,
                    COUNT(*) AS n,
@@ -138,7 +139,7 @@ def build_derived_tables(con: sqlite3.Connection) -> None:
             FROM fact_transaction
             GROUP BY ym, channel, customer_id
         )
-        SELECT ym AS month,
+        SELECT month_date,
                channel,
                ROUND(SUM(customer_gmv), 2) AS gmv,
                SUM(n) AS items,
@@ -149,7 +150,7 @@ def build_derived_tables(con: sqlite3.Connection) -> None:
                    2
                ) AS repurchase_rate
         FROM per_customer
-        GROUP BY ym, channel
+        GROUP BY month_date, channel
         """
     )
     con.commit()
@@ -243,6 +244,25 @@ def build_derived_tables(con: sqlite3.Connection) -> None:
     con.execute("DROP TABLE IF EXISTS _activity")
     con.commit()
 
+    log("构建 category_monthly(品类月度销售)...")
+    con.execute("DROP TABLE IF EXISTS category_monthly")
+    con.execute(
+        """
+        CREATE TABLE category_monthly AS
+        SELECT strftime('%Y-%m', t.t_dat) AS month,
+               strftime('%Y-%m-01', t.t_dat) AS month_date,
+               a.product_group_name AS product_group,
+               a.department_name AS department,
+               ROUND(SUM(t.price), 2) AS gmv,
+               COUNT(*) AS items,
+               COUNT(DISTINCT t.customer_id) AS customers
+        FROM fact_transaction t
+        JOIN dim_article a ON a.article_id = t.article_id
+        GROUP BY month_date, product_group, department
+        """
+    )
+    con.commit()
+
 
 def main() -> None:
     ap = argparse.ArgumentParser()
@@ -279,6 +299,7 @@ def main() -> None:
     for table in [
         "dim_customer", "dim_article", "fact_transaction",
         "daily_sales", "monthly_metrics", "rfm", "cohort_retention",
+        "category_monthly",
     ]:
         n = con.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
         log(f"{table}: {n:,} 行")

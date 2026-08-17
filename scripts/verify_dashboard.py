@@ -23,8 +23,23 @@ BASE_URL = os.environ.get("SUPERSET_URL", "http://localhost:8088").rstrip("/")
 USERNAME = os.environ.get("SUPERSET_USER", "admin")
 PASSWORD = os.environ.get("SUPERSET_PASSWORD", "admin")
 
-# H&M 看板下的 13 张图表 id(由 build_superset_dashboard.py 创建)
-CHART_IDS = [104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116]
+# H&M 看板的图表名称(由 build_superset_dashboard.py 创建)。
+# 验证时按名称在 Superset 中查询 id, 不依赖固定 id(新环境 id 必然不同)。
+CHART_NAMES = [
+    "累计 GMV(万)",
+    "累计售出件数(万)",
+    "累计活跃客户(万)",
+    "平均月度复购率(%)",
+    "月度 GMV 趋势",
+    "月度件数与客户数",
+    "渠道销售对比",
+    "用户分层占比",
+    "各分层消费贡献",
+    "月度留存热力图",
+    "品类销售 TOP10",
+    "品类月度销售明细",
+    "RFM 分层汇总表",
+]
 
 
 def api(path: str, token: str | None = None, payload: dict | None = None) -> dict:
@@ -65,9 +80,14 @@ def build_query_payload(chart: dict) -> dict:
     ds_id = chart["datasource_id"]
     viz = chart["viz_type"]
 
-    columns = list(params.get("groupby") or [])
-    if viz == "echarts_heatmap":
+    gb = params.get("groupby") or []
+    if isinstance(gb, str):  # heatmap_v2 等图表的 groupby 可能是单个字符串
+        gb = [gb]
+    columns = list(gb)
+    if viz in ("heatmap_v2", "echarts_heatmap"):
         columns = [c for c in (params.get("x_axis"), params.get("y_axis")) if c]
+        if not columns and gb:
+            columns = list(gb)
 
     metrics = list(params.get("metrics") or [])
     if not metrics and params.get("metric"):
@@ -95,7 +115,29 @@ def build_query_payload(chart: dict) -> dict:
     }
 
 
+def resolve_chart_ids(token: str) -> tuple[list[int], list[str]]:
+    """按图表名称查询 id; 返回 (找到的 id 列表, 未找到的名称列表)。"""
+    charts = api("/api/v1/chart/?q=(page_size:1000)", token=token)["result"]
+    id_by_name = {c["slice_name"]: c["id"] for c in charts}
+    found, missing = [], []
+    for name in CHART_NAMES:
+        if name in id_by_name:
+            found.append(id_by_name[name])
+        else:
+            missing.append(name)
+    return found, missing
+
+
 def main() -> int:
+    import argparse
+
+    ap = argparse.ArgumentParser(description="验证 H&M 看板所有图表能正常出数")
+    ap.add_argument(
+        "--ids", type=int, nargs="*", default=None,
+        help="手动指定图表 id 列表(名称被改过时使用)",
+    )
+    args = ap.parse_args()
+
     token = api(
         "/api/v1/security/login",
         payload={
@@ -106,9 +148,21 @@ def main() -> int:
         },
     )["access_token"]
 
+    if args.ids:
+        chart_ids = args.ids
+        print(f"使用手动指定图表 id: {chart_ids}")
+    else:
+        chart_ids, missing = resolve_chart_ids(token)
+        if missing:
+            print("以下图表未按默认名称找到(可能被改名):")
+            for name in missing:
+                print(f"  - {name}")
+            print("可运行: python scripts/verify_dashboard.py --ids <id1> <id2> ...")
+            return 1
+
     failures = []
-    print(f"待验证图表: {len(CHART_IDS)} 张\n")
-    for chart_id in CHART_IDS:
+    print(f"待验证图表: {len(chart_ids)} 张\n")
+    for chart_id in chart_ids:
         chart = api(f"/api/v1/chart/{chart_id}", token=token)["result"]
         name = chart["slice_name"]
         try:
@@ -123,7 +177,7 @@ def main() -> int:
             failures.append((chart_id, name, detail))
         print(f"[{status}] #{chart_id} {name} -> {detail}")
 
-    print(f"\n结果: {len(CHART_IDS) - len(failures)}/{len(CHART_IDS)} 通过")
+    print(f"\n结果: {len(chart_ids) - len(failures)}/{len(chart_ids)} 通过")
     if failures:
         print("\n失败的图表:")
         for chart_id, name, detail in failures:
