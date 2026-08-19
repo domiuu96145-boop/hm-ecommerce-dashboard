@@ -179,6 +179,27 @@ def ensure_temporal_column(
     print(f"  已将 {column_name} 标记为时间列 (dataset id={ds_id})")
 
 
+def create_sql_dataset(
+    session: requests.Session, token: str, csrf_token: str,
+    db_id: int, table_name: str, sql: str,
+) -> int:
+    """创建 SQL 虚拟数据集(已存在则直接复用)。"""
+    data = api_get(session, token, "/api/v1/dataset/?q=(page_size:500)")
+    for row in data["result"]:
+        if row["database"]["id"] == db_id and row["table_name"] == table_name:
+            print(f"  SQL数据集已存在: {table_name} (id={row['id']})")
+            return row["id"]
+    payload = {
+        "database": db_id,
+        "schema": "main",
+        "table_name": table_name,
+        "sql": sql,
+    }
+    created = api_post(session, token, csrf_token, "/api/v1/dataset/", payload)
+    print(f"  创建SQL数据集: {table_name} (id={created['id']})")
+    return created["id"]
+
+
 def create_chart(
     session: requests.Session, token: str, csrf_token: str,
     ds_id: int, name: str, viz_type: str, params: dict,
@@ -187,16 +208,8 @@ def create_chart(
     for row in existing["result"]:
         if row["slice_name"] == name:
             cid = row["id"]
-            cur = api_get(session, token, f"/api/v1/chart/{cid}")["result"]
-            cur_params = json.loads(cur["params"] or "{}")
-            if cur["viz_type"] != viz_type or cur_params != params:
-                api_put(session, token, csrf_token, f"/api/v1/chart/{cid}", {
-                    "viz_type": viz_type,
-                    "params": json.dumps(params, ensure_ascii=False),
-                })
-                print(f"  更新图表: {name} (id={cid})")
-            else:
-                print(f"  图表已存在: {name} (id={cid})")
+            # 已存在则复用, 不覆盖手工调整过的配置
+            print(f"  图表已存在(复用): {name} (id={cid})")
             return cid
     payload = {
         "datasource_id": ds_id,
@@ -231,6 +244,43 @@ def main() -> int:
         ds_ids[t] = ensure_dataset(session, token, csrf_token, db_id, t)
     for t in ("monthly_metrics", "category_monthly"):
         ensure_temporal_column(session, token, csrf_token, ds_ids[t], "month_date")
+
+    # 用户维度分析所需的 SQL 虚拟数据集(年龄段 / 会员×新闻订阅)
+    age_sql = """
+        SELECT
+          CASE
+            WHEN c.age < 18 THEN '18岁以下'
+            WHEN c.age < 25 THEN '18-24岁'
+            WHEN c.age < 35 THEN '25-34岁'
+            WHEN c.age < 45 THEN '35-44岁'
+            WHEN c.age IS NULL THEN '年龄未知'
+            ELSE '45岁以上'
+          END AS age_group,
+          COUNT(*) AS 客户数,
+          ROUND(SUM(r.monetary), 0) AS 消费额,
+          ROUND(100.0 * SUM(r.monetary) / SUM(SUM(r.monetary)) OVER (), 2) AS 消费占比
+        FROM rfm r
+        JOIN dim_customer c ON c.customer_id = r.customer_id
+        GROUP BY age_group
+    """
+    member_sql = """
+        SELECT
+          CASE WHEN c.club_member_status='ACTIVE' THEN '会员' ELSE '非会员' END || '·' ||
+          CASE WHEN c.FN=1 THEN '订阅新闻' ELSE '未订阅' END AS 客群,
+          COUNT(DISTINCT r.customer_id) AS 客户数,
+          ROUND(SUM(r.monetary), 0) AS 消费额,
+          ROUND(100.0 * SUM(r.monetary) / SUM(SUM(r.monetary)) OVER (), 2) AS 消费占比,
+          ROUND(SUM(r.monetary) / COUNT(DISTINCT r.customer_id), 2) AS 人均消费
+        FROM rfm r
+        JOIN dim_customer c ON c.customer_id = r.customer_id
+        GROUP BY 客群
+    """
+    ds_ids["age_group"] = create_sql_dataset(
+        session, token, csrf_token, db_id, "年龄段消费", age_sql
+    )
+    ds_ids["member_news"] = create_sql_dataset(
+        session, token, csrf_token, db_id, "会员新闻客群", member_sql
+    )
 
     charts: list[tuple[str, int, str]] = []  # (name, chart_id, chart_uuid)
 
@@ -290,6 +340,18 @@ def main() -> int:
                      metric("monetary", "SUM", "消费额"),
                      metric("frequency", "AVG", "平均购买次数")],
          "groupby": ["segment"], "time_range": "No filter", "row_limit": 10})
+
+    # 用户维度: 年龄段消费占比(饼图) 与 会员×新闻订阅客群价值(表格)
+    add("age_group", "年龄分层销售额对比", "pie",
+        {"metric": metric("消费额", "SUM", "消费额"), "groupby": ["age_group"],
+         "time_range": "No filter", "row_limit": 10,
+         "label_type": "value_percent", "show_labels": True, "show_legend": True})
+    add("member_news", "组合客群：会员×新闻", "table",
+        {"metrics": [metric("客户数", "SUM", "客户数"),
+                     metric("消费额", "SUM", "消费额"),
+                     metric("消费占比", "SUM", "消费占比"),
+                     metric("人均消费", "SUM", "人均消费")],
+         "groupby": ["客群"], "time_range": "No filter", "row_limit": 10})
 
     # 创建/复用看板
     dash_title = "H&M 电商经营分析看板"
